@@ -116,7 +116,15 @@ tail -f ~/.local/state/chatgpt-node-guard/guard.log         # 引擎侧
 
 ## 配置项
 
-全部通过环境变量覆盖（App 调用脚本时继承自身环境，改定时任务的参数需要改 `app/App.swift` 后重新构建）：
+命令行直接调用脚本时，可以用环境变量覆盖下面所有参数：
+
+```bash
+CNG_PROBES=6 ~/.local/bin/vpn-node-guard.sh --status
+```
+
+> ⚠️ **App 调用脚本时用的是固定环境**（只传 `PATH` 和 `HOME`），所以从 shell `export` 的变量**不会**影响 App 的自动检测。
+> 想让 App 也生效，目前需要直接改 `engine/vpn-node-guard.sh` 里的默认值，然后跑一次 `./install.sh`。
+> 检测间隔则在 `app/App.swift` 的 `GuardModel.intervalMinutes`。
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
