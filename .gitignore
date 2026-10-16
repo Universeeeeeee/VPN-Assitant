@@ -1,0 +1,5 @@
+# 忽略构建产物与本地状态
+.preview-bin
+*.app/
+build/
+.DS_Store

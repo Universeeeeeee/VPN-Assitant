@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>
+    <string>VPNNodeHelper</string>
+    <key>CFBundleDisplayName</key>
+    <string>VPN节点助手</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.vae.vpn-node-helper</string>
+    <key>CFBundleExecutable</key>
+    <string>VPNNodeHelper</string>
+    <key>CFBundleVersion</key>
+    <string>1.0</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>13.0</string>
+    <!-- 只在菜单栏显示, 不出现在 Dock 和 Command-Tab -->
+    <key>LSUIElement</key>
+    <true/>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+</dict>
+</plist>
