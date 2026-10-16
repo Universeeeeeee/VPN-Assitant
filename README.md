@@ -138,13 +138,22 @@ tail -f ~/.local/state/chatgpt-node-guard/guard.log         # 引擎侧
 
 想改检测间隔、菜单栏文案，改 `app/App.swift` 里的 `GuardModel.intervalMinutes` 和 `menuBarText`，然后重新构建。
 
-## 界面预览
+## 本地开发
 
-改完 UI 不用点菜单栏，直接离屏渲染一张 PNG 就能看：
+仓库就是唯一的源码。改完 `engine/vpn-node-guard.sh` 或 `app/App.swift` 后：
+
+```bash
+./install.sh          # 重装引擎 + 重新构建 App + 启动
+```
+
+只想看界面效果、不想重装，可以离屏渲染一张 PNG（不需要点菜单栏）：
 
 ```bash
 ./app/preview.sh /tmp/panel.png
 ```
+
+> ⚠️ App 运行时优先调用 `~/.local/bin/vpn-node-guard.sh`。
+> **改了引擎必须跑一次 `install.sh`**，否则 App 用的还是旧引擎。
 
 ## 项目结构
 
