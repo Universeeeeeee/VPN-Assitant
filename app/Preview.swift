@@ -22,7 +22,7 @@ extension GuardModel {
                 name: "美国LA-优化2-GPT", ok: 1, total: 4, median: "5642",
                 exit_ip: "2001:470:305c:d04b:cf42:e9f5:3f91:4b9c",
                 prev_ip: "23.237.196.226", ip_changed: true,
-                ip_history_count: 3, error: "Timeout"),
+                ip_history_count: 3, ip_window_h: 24, error: "Timeout"),
             recommend: RecommendInfo(name: "英国-优化-GPT", ok: "4", total: "4", median: "1766", excluded: true),
             candidates: [
                 Candidate(name: "英国-优化-GPT", ok: 4, total: 4, median: "1766", rotating: false, excluded: true),

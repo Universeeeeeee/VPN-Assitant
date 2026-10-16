@@ -40,6 +40,7 @@ DOWN_ALERT_IMMEDIATE="${CNG_DOWN_ALERT_IMMEDIATE:-1}"  # 完全不通时立即�
 CONFIRM_RETRY="${CNG_CONFIRM_RETRY:-1}"               # 探活 0/N 时先复测确认, 避免瞬时抖动误报
 CONFIRM_DELAY_S="${CNG_CONFIRM_DELAY_S:-10}"          # 复测前等待秒数
 EXCLUDE_REGIONS="${CNG_EXCLUDE_REGIONS:-英国,香港}"    # 不建议切换到的地区 (逗号分隔, 按节点名前缀匹配)
+PARALLEL="${CNG_PARALLEL:-1}"                         # 1=并行探测候选节点 (大幅缩短不健康时的耗时)
 COOLDOWN_H="${CNG_COOLDOWN_H:-12}"                # 仅 --switch 模式使用
 EMERGENCY_H="${CNG_EMERGENCY_H:-1}"               # 仅 --switch 模式使用
 ACTIVE_WINDOW_S="${CNG_ACTIVE_WINDOW_S:-300}"     # 仅 --switch 模式使用
@@ -47,12 +48,12 @@ MAX_DEFER="${CNG_MAX_DEFER:-3}"                   # 仅 --switch 模式使用
 DEFER_ON_ACTIVE="${CNG_DEFER_ON_ACTIVE:-1}"       # 仅 --switch 模式使用
 ACTIVE_PATTERN="${CNG_ACTIVE_PATTERN:-chatgpt|openai|oaistatic|oaiusercontent}"
 MAX_CANDIDATES="${CNG_MAX_CANDIDATES:-6}"         # 报告里最多列几个候选
-IP_HISTORY_MAX="${CNG_IP_HISTORY_MAX:-5}"         # 每个节点最多记几个历史出口 IP
+IP_WINDOW_H="${CNG_IP_WINDOW_H:-24}"               # 出口 IP 观测统计窗口(小时), 见下方"出口 IP 观测记录"
 
 STATE_DIR="${CNG_STATE_DIR:-$HOME/.local/state/chatgpt-node-guard}"
 LOG_FILE="$STATE_DIR/guard.log"
 STATE_FILE="$STATE_DIR/state"
-IP_HIST_FILE="$STATE_DIR/ip-history"
+IP_HIST_FILE="$STATE_DIR/ip-history.tsv"
 LOG_MAX_LINES=3000
 QUIET_STDOUT=0
 
@@ -132,23 +133,42 @@ jesc() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
 # ------------------------------- 运行锁 ------------------------------------
 
 LOCK_DIR="$STATE_DIR/lock"
-LOCK_STALE_S=1800
-if ! mkdir "$LOCK_DIR" 2>/dev/null; then
-  LOCK_AGE=$(( $(date +%s) - $(stat -f %m "$LOCK_DIR" 2>/dev/null || echo 0) ))
-  if [ "$LOCK_AGE" -gt "$LOCK_STALE_S" ]; then
-    rmdir "$LOCK_DIR" 2>/dev/null
-    mkdir "$LOCK_DIR" 2>/dev/null || { log SKIP "无法获取运行锁, 跳过本次"; exit 0; }
-    log WARN "清理了陈旧的运行锁 (${LOCK_AGE}s)"
-  else
-    log SKIP "已有另一个实例正在运行 (锁存在 ${LOCK_AGE}s), 跳过本次"
-    if [ "$MODE" = "json" ]; then
-      printf '{"ok":false,"vpn":true,"state":"busy","alert":false,'
-      printf '"message":"上一次检测仍在进行中","ts":"%s"}\n' "$(date '+%Y-%m-%d %H:%M:%S')"
-    fi
-    exit 0
+LOCK_PID_FILE="$LOCK_DIR/pid"
+# 并行探测后单次运行最长约 2~3 分钟, 600 秒足够宽松; 真正的兜底是下面的 PID 检查
+LOCK_STALE_S="${CNG_LOCK_STALE_S:-600}"
+
+# 抢占运行锁。锁里记持有者 PID: 进程已经不在了就立刻清理,
+# 而不是干等到超时 —— 否则 App 被强杀/崩溃后, 锁会一直卡住后续检测。
+acquire_lock() {
+  if mkdir "$LOCK_DIR" 2>/dev/null; then
+    printf '%s' "$$" >"$LOCK_PID_FILE" 2>/dev/null
+    return 0
   fi
+  local owner age
+  owner="$(cat "$LOCK_PID_FILE" 2>/dev/null)"
+  age=$(( $(date +%s) - $(stat -f %m "$LOCK_DIR" 2>/dev/null || echo 0) ))
+  if [ -n "$owner" ] && ! kill -0 "$owner" 2>/dev/null; then
+    log WARN "发现僵尸运行锁 (持有进程 $owner 已不存在), 清理后继续"
+  elif [ "$age" -gt "$LOCK_STALE_S" ]; then
+    log WARN "清理了陈旧的运行锁 (已存在 ${age}s)"
+  else
+    return 1
+  fi
+  rm -rf "$LOCK_DIR"
+  mkdir "$LOCK_DIR" 2>/dev/null || return 1
+  printf '%s' "$$" >"$LOCK_PID_FILE" 2>/dev/null
+  return 0
+}
+
+if ! acquire_lock; then
+  log SKIP "已有另一个实例正在运行, 跳过本次"
+  if [ "$MODE" = "json" ]; then
+    printf '{"ok":false,"vpn":true,"state":"busy","alert":false,'
+    printf '"message":"上一次检测仍在进行中","ts":"%s"}\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+  fi
+  exit 0
 fi
-trap 'rmdir "$LOCK_DIR" 2>/dev/null' EXIT INT TERM
+trap 'rm -rf "$LOCK_DIR" 2>/dev/null' EXIT INT TERM
 
 # --------------------------- mihomo 接口 -----------------------------------
 
@@ -250,33 +270,42 @@ current_exit_ip() {
     sed -n 's/^ip=//p' | head -n1
 }
 
-# --------------------------- 出口 IP 历史 ----------------------------------
-# 记录每个节点曾经出现过的出口 IP。出现 2 个以上 = 已知会轮换 = ChatGPT 必挂。
-
-ip_hist_get() { [ -f "$IP_HIST_FILE" ] && awk -F'\t' -v n="$1" '$1==n{print $2}' "$IP_HIST_FILE" | head -n1; }
+# --------------------------- 出口 IP 观测记录 ------------------------------
+# 每行一条观测: epoch <TAB> 节点名 <TAB> 出口IP
+#
+# 只统计最近 IP_WINDOW_H 小时。原来的实现是"永久累计曾经出现过的 IP",
+# 界面上显示成"历史出现过 N 个"——没有时间范围, 指代不明: 三天前出现过一次的
+# IP 和刚刚轮换出来的 IP 被算在一起。改成时间窗后:
+#   · 数字有明确含义 ("近 24 小时出现过 N 个")
+#   · 反映的是节点的当前行为, 机场修好了轮换问题也能自动摘掉标记
+#   (窗口小时数 IP_WINDOW_H 在配置段定义)
 
 ip_hist_add() {
-  local node="$1" ip="$2" cur new tmp
+  local node="$1" ip="$2" now last tmp
   [ -z "$ip" ] && return
-  [ -f "$IP_HIST_FILE" ] || : >"$IP_HIST_FILE"
-  cur="$(ip_hist_get "$node")"
-  case ",$cur," in
-    *",$ip,"*) return ;;
-  esac
-  if [ -z "$cur" ]; then new="$ip"; else new="$cur,$ip"; fi
-  # 只保留最近 IP_HISTORY_MAX 个
-  new="$(printf '%s' "$new" | tr ',' '\n' | tail -n "$IP_HISTORY_MAX" | paste -sd, -)"
-  tmp="$IP_HIST_FILE.tmp"
-  awk -F'\t' -v n="$node" '$1!=n' "$IP_HIST_FILE" >"$tmp" 2>/dev/null
-  printf '%s\t%s\n' "$node" "$new" >>"$tmp"
-  mv "$tmp" "$IP_HIST_FILE"
+  now=$(date +%s)
+
+  # 同一节点、同一 IP 且与上一条相同就不重复记 (稳定节点只留 1 条)
+  last="$(awk -F'\t' -v n="$node" '$2==n{print $3}' "$IP_HIST_FILE" 2>/dev/null | tail -n1)"
+  if [ "$last" != "$ip" ]; then
+    printf '%s\t%s\t%s\n' "$now" "$node" "$ip" >>"$IP_HIST_FILE"
+  fi
+
+  # 修剪: 保留 2 倍窗口, 便于以后想放宽窗口时不至于没数据
+  if [ -f "$IP_HIST_FILE" ]; then
+    tmp="$IP_HIST_FILE.tmp"
+    awk -F'\t' -v c="$(( now - IP_WINDOW_H * 3600 * 2 ))" '$1 >= c' "$IP_HIST_FILE" >"$tmp" 2>/dev/null
+    mv "$tmp" "$IP_HIST_FILE"
+  fi
 }
 
+# 最近 IP_WINDOW_H 小时内, 该节点出现过几个不同的出口 IP
 ip_hist_count() {
-  local v
-  v="$(ip_hist_get "$1")"
-  [ -z "$v" ] && { printf '0'; return; }
-  printf '%s' "$v" | tr ',' '\n' | grep -c .
+  local node="$1" cutoff
+  [ -f "$IP_HIST_FILE" ] || { printf '0'; return; }
+  cutoff=$(( $(date +%s) - IP_WINDOW_H * 3600 ))
+  awk -F'\t' -v n="$node" -v c="$cutoff" '$2==n && $1>=c {print $3}' "$IP_HIST_FILE" |
+    sort -u | grep -c .
 }
 
 # ------------------------------- 状态 --------------------------------------
@@ -418,11 +447,51 @@ CANDS=""
 BEST_NAME=""; BEST_OK=""; BEST_TOT=""; BEST_MED=""; BEST_EXCLUDED=0
 if [ "$STATE" != "healthy" ]; then
   CUR_REGION="$(region_of "$CURRENT")"
-  : >"$STATE_DIR/candidates.tmp"
+
+  # 收集待测候选
+  CAND_LIST=""
   for m in $(group_members); do
     [ "$m" = "$CURRENT" ] && continue
     is_group_ref "$(node_type "$m")" && continue
-    split4 "$(probe_node "$m")"
+    CAND_LIST="$CAND_LIST$m
+"
+  done
+
+  # 并行探测。mihomo 的 delay 保护是按节点加的, 不同节点互不阻塞
+  # (实测 3 路并发全部正常返回)。这些节点共用同一个中转入口, 但实测并发
+  # 不会降低成功率 —— 单独测 4/4, 6 路并发时同样 4/4; 只是延迟数值抖动变大,
+  # 而延迟在这里仅用于平局比较。收益是候选阶段从"逐个累加"变成"取最慢的一个"。
+  PROBE_DIR="$STATE_DIR/probe"
+  if [ -n "$STATE_DIR" ] && [ -n "$PROBE_DIR" ] && [ "$PROBE_DIR" != "$STATE_DIR" ]; then
+    rm -rf "$PROBE_DIR"
+  fi
+  mkdir -p "$PROBE_DIR"
+
+  idx=0
+  while IFS= read -r m; do
+    [ -z "$m" ] && continue
+    idx=$((idx + 1))
+    printf '%s' "$m" >"$PROBE_DIR/$idx.name"
+    if [ "$PARALLEL" = "1" ]; then
+      (
+        split4 "$(probe_node "$m")"
+        printf '%s|%s|%s|%s' "$S1" "$S2" "$S3" "$S4" >"$PROBE_DIR/$idx.res"
+      ) &
+    else
+      split4 "$(probe_node "$m")"
+      printf '%s|%s|%s|%s' "$S1" "$S2" "$S3" "$S4" >"$PROBE_DIR/$idx.res"
+    fi
+  done <<<"$CAND_LIST"
+  [ "$PARALLEL" = "1" ] && wait
+
+  : >"$STATE_DIR/candidates.tmp"
+  for namefile in "$PROBE_DIR"/*.name; do
+    [ -f "$namefile" ] || continue
+    m="$(cat "$namefile")"
+    resfile="${namefile%.name}.res"
+    [ -f "$resfile" ] || continue
+    split4 "$(cat "$resfile")"
+    S1="${S1:-0}"; S2="${S2:-$PROBES}"
     rot=0
     [ "$(ip_hist_count "$m")" -ge 2 ] && rot=1
     same=0
@@ -435,6 +504,7 @@ if [ "$STATE" != "healthy" ]; then
       "$excl" "$rot" "$((S1 * 1000 / S2))" "$same" "$sortmed" "$m" "$S1" "$S2" \
       >>"$STATE_DIR/candidates.tmp"
   done
+  rm -rf "$PROBE_DIR"
   sort -t'|' -k1,1n -k2,2n -k3,3nr -k4,4nr -k5,5n "$STATE_DIR/candidates.tmp" \
     >"$STATE_DIR/candidates.sorted" 2>/dev/null
   n=0
@@ -475,9 +545,9 @@ if [ "$MODE" = "json" ]; then
   printf '"state":"%s","alert":%s,"streak":%s,"transient":%s,"reason":"%s",' \
     "$STATE" "$([ "$ALERT" = 1 ] && echo true || echo false)" "$STREAK" \
     "$([ "$TRANSIENT" = 1 ] && echo true || echo false)" "$(jesc "$REASON")"
-  printf '"current":{"name":"%s","ok":%s,"total":%s,"median":"%s","exit_ip":"%s","prev_ip":"%s","ip_changed":%s,"ip_history_count":%s,"error":"%s"},' \
+  printf '"current":{"name":"%s","ok":%s,"total":%s,"median":"%s","exit_ip":"%s","prev_ip":"%s","ip_changed":%s,"ip_history_count":%s,"ip_window_h":%s,"error":"%s"},' \
     "$(jesc "$CURRENT")" "$CUR_OK" "$CUR_TOT" "$CUR_MED" "$(jesc "$CUR_IP")" "$(jesc "$LAST_IP")" \
-    "$([ "$IP_CHANGED" = 1 ] && echo true || echo false)" "$CUR_IP_HIST_COUNT" "$(jesc "$CUR_ERR")"
+    "$([ "$IP_CHANGED" = 1 ] && echo true || echo false)" "$CUR_IP_HIST_COUNT" "$IP_WINDOW_H" "$(jesc "$CUR_ERR")"
   printf '"recommend":{"name":"%s","ok":"%s","total":"%s","median":"%s","excluded":%s},' \
     "$(jesc "$BEST_NAME")" "$BEST_OK" "$BEST_TOT" "$BEST_MED" \
     "$([ "$BEST_EXCLUDED" = "1" ] && echo true || echo false)"
@@ -506,7 +576,7 @@ esac
 printf '当前节点: %s\n' "$CURRENT"
 printf '原因:     %s\n' "$REASON"
 printf '探活:     %s/%s 成功, 中位延迟 %sms\n' "$CUR_OK" "$CUR_TOT" "$CUR_MED"
-printf '出口 IP:  %s (历史出现过 %s 个)\n' "${CUR_IP:-未知}" "$CUR_IP_HIST_COUNT"
+printf '出口 IP:  %s (近 %s 小时出现过 %s 个不同出口 IP)\n' "${CUR_IP:-未知}" "$IP_WINDOW_H" "$CUR_IP_HIST_COUNT"
 if [ "$IP_CHANGED" = 1 ]; then
   printf '          ⚠️  上次是 %s, 已发生变化\n' "$LAST_IP"
 fi

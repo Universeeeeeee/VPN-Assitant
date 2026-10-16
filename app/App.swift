@@ -23,6 +23,8 @@ struct CurrentInfo: Codable {
     var prev_ip: String
     var ip_changed: Bool
     var ip_history_count: Int
+    /// 上面那个计数的统计窗口(小时), 由引擎给出, 避免界面上出现没有时间范围的"历史"
+    var ip_window_h: Int?
     var error: String
 }
 
@@ -113,7 +115,7 @@ enum Engine {
         await Task.detached(priority: .utility) { performCheck() }.value
     }
 
-    private static func performCheck() -> CheckOutcome {
+    private static func performCheck(timeout: TimeInterval = 300) -> CheckOutcome {
         guard let script = scriptPath() else {
             return .failure("找不到检测脚本 vpn-node-guard.sh")
         }
@@ -136,8 +138,20 @@ enum Engine {
             return .failure("无法启动检测脚本: \(error.localizedDescription)")
         }
 
+        // 超时保护: 正常情况下单次检测 15~40 秒, 节点不稳定时并行探测候选约 40~150 秒。
+        // 给足 300 秒; 真超时就 SIGTERM 掉 —— 脚本的 trap 会释放运行锁,
+        // 否则 App 会永远停在"检测中"。
+        let watchdog = DispatchWorkItem {
+            if proc.isRunning {
+                NSLog("检测脚本超时 (%.0f 秒), 终止", timeout)
+                proc.terminate()
+            }
+        }
+        DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: watchdog)
+
         let data = outPipe.fileHandleForReading.readDataToEndOfFile()
         proc.waitUntilExit()
+        watchdog.cancel()
 
         let text = String(data: data, encoding: .utf8) ?? ""
         // 脚本可能先输出日志再输出 JSON, 取最后一个非空行
@@ -149,6 +163,9 @@ enum Engine {
         guard !line.isEmpty, let jsonData = line.data(using: .utf8) else {
             let errText = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(),
                                 encoding: .utf8) ?? ""
+            if proc.terminationStatus == 15 {
+                return .failure("检测超时 (\(Int(timeout)) 秒) 已中止, 请点「立即检测」重试")
+            }
             return .failure("检测脚本没有返回结果 (退出码 \(proc.terminationStatus)) \(errText)")
         }
 
@@ -167,6 +184,9 @@ final class GuardModel: ObservableObject {
     @Published var running = false
     @Published var errorText: String?
     @Published var lastRunAt: Date?
+    /// 本轮检测的开始时间, 用于显示"已用时" —— 不稳定时要并行探测所有候选,
+    /// 可能耗时 1~2 分钟, 没有进度提示会让人以为卡死了
+    @Published var checkStartedAt: Date?
 
     /// 检测间隔(分钟)。改这里即可调整频率。
     let intervalMinutes: Double = 30
@@ -197,23 +217,34 @@ final class GuardModel: ObservableObject {
         if running { return }
         running = true
         errorText = nil
+        checkStartedAt = Date()
         Task { @MainActor in
             let result = await Engine.check()
+            let took = self.checkStartedAt.map { Date().timeIntervalSince($0) } ?? 0
             self.running = false
+            self.checkStartedAt = nil
             self.lastRunAt = Date()
             switch result {
             case .success(let r):
                 self.report = r
                 let cur = r.current
-                AppLog.write("检测完成 state=\(r.state) node=\(cur?.name ?? "-") "
-                    + "ok=\(cur?.ok ?? -1)/\(cur?.total ?? -1) "
-                    + "ip=\(cur?.exit_ip ?? "-") alert=\(r.alert)")
+                AppLog.write(String(format: "检测完成 用时%.1fs state=%@ node=%@ ok=%d/%d ip=%@ alert=%@",
+                                    took, r.state, cur?.name ?? "-",
+                                    cur?.ok ?? -1, cur?.total ?? -1,
+                                    cur?.exit_ip ?? "-", r.alert ? "true" : "false"))
                 self.evaluateAlert(r)
             case .failure(let msg):
                 self.errorText = msg
-                AppLog.write("检测失败: \(msg)")
+                AppLog.write(String(format: "检测失败 用时%.1fs: %@", took, msg))
             }
         }
+    }
+
+    /// 把秒数格式化成 12 秒 / 1 分 05 秒
+    static func elapsedText(_ from: Date) -> String {
+        let seconds = max(0, Int(Date().timeIntervalSince(from)))
+        if seconds < 60 { return "\(seconds) 秒" }
+        return String(format: "%d 分 %02d 秒", seconds / 60, seconds % 60)
     }
 
     /// 只在"问题刚开始"或"恶化为完全不通"时提醒一次, 避免每 30 分钟轰炸
@@ -346,6 +377,21 @@ struct PanelView: View {
 
     @ViewBuilder
     private var content: some View {
+        // 检测进行中时, 用 TimelineView 每秒刷新"已用时" ——
+        // 节点不稳定时要并行探测所有候选, 可能跑 1~2 分钟,
+        // 没有进度反馈会让人以为卡死了。
+        if model.running, let startedAt = model.checkStartedAt {
+            TimelineView(.periodic(from: .now, by: 1)) { _ in
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.small)
+                    Text("正在检测… 已用时 \(GuardModel.elapsedText(startedAt))")
+                        .font(.system(size: 12, weight: .medium))
+                    Spacer()
+                }
+                .padding(.vertical, 2)
+            }
+        }
+
         if let err = model.errorText {
             Label(err, systemImage: "exclamationmark.circle")
                 .font(.system(size: 11))
@@ -355,14 +401,19 @@ struct PanelView: View {
                 Text(r.message ?? "Clash Verge 未运行，无需体检。")
                     .font(.system(size: 12))
             } else if r.state == "busy" {
-                Text(r.message ?? "上一次检测仍在进行中。")
-                    .font(.system(size: 12))
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(r.message ?? "另一个检测进程正在运行")
+                        .font(.system(size: 12))
+                    Text("通常几秒内就会结束；若一直如此，点「立即检测」会清理掉已死进程留下的锁。")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                }
             } else {
                 nodeSection(r)
                 if r.state != "healthy" { recommendSection(r) }
                 if let cands = r.candidates, !cands.isEmpty { candidateSection(cands) }
             }
-        } else {
+        } else if !model.running {
             Text("正在检测…").font(.system(size: 12))
         }
     }
@@ -386,12 +437,15 @@ struct PanelView: View {
                             Text("⚠️ 与上次不同（上次 \(c.prev_ip)）")
                                 .font(.system(size: 10))
                                 .foregroundStyle(.orange)
-                        } else if c.ip_history_count >= 2 {
-                            Text("⚠️ 历史上出现过 \(c.ip_history_count) 个不同出口 IP")
+                        }
+                        // 这个计数始终显示。原来放在 else 分支里, 只有"IP 没变"时才出现,
+                        // 而它恰恰是判断节点会不会轮换的关键信息, 不该被"与上次不同"挤掉。
+                        if c.ip_history_count >= 2 {
+                            Text("近 \(c.ip_window_h ?? 24) 小时出现过 \(c.ip_history_count) 个不同出口 IP")
                                 .font(.system(size: 10))
                                 .foregroundStyle(.orange)
                         } else {
-                            Text("近期稳定")
+                            Text("近 \(c.ip_window_h ?? 24) 小时出口 IP 稳定")
                                 .font(.system(size: 10))
                                 .foregroundStyle(.green)
                         }
