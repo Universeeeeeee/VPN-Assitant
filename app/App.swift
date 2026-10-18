@@ -336,7 +336,6 @@ final class GuardModel: ObservableObject {
 
 struct PanelView: View {
     @ObservedObject var model: GuardModel
-    @State private var copied: String?
 
     private var report: Report? { model.report }
 
@@ -485,10 +484,6 @@ struct PanelView: View {
                             .clipShape(RoundedRectangle(cornerRadius: 3))
                     }
                     Spacer()
-                    Button(copied == rec.name ? "已复制" : "复制") {
-                        copy(rec.name)
-                    }
-                    .controlSize(.mini)
                 }
                 Text("探活 \(rec.ok)/\(rec.total)" + (rec.median.isEmpty || rec.median == "-" ? "" : "，中位 \(rec.median)ms"))
                     .font(.system(size: 10))
@@ -544,8 +539,6 @@ struct PanelView: View {
                         .font(.system(size: 10, design: .monospaced))
                         .foregroundStyle(.secondary)
                         .frame(width: 58, alignment: .trailing)
-                    Button(copied == c.name ? "✓" : "复制") { copy(c.name) }
-                        .controlSize(.mini)
                 }
             }
         }
@@ -586,16 +579,6 @@ struct PanelView: View {
                 Button("退出") { NSApplication.shared.terminate(nil) }
             }
             .controlSize(.small)
-        }
-    }
-
-    private func copy(_ text: String) {
-        let pb = NSPasteboard.general
-        pb.clearContents()
-        pb.setString(text, forType: .string)
-        copied = text
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-            if copied == text { copied = nil }
         }
     }
 
