@@ -27,7 +27,7 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 echo "▶ 编译 Swift 源码"
 swiftc -O -swift-version 5 -parse-as-library \
   -target arm64-apple-macos13.0 \
-  -framework AppKit -framework SwiftUI -framework UserNotifications \
+  -framework AppKit -framework SwiftUI -framework UserNotifications -framework SystemConfiguration \
   -o "$APP/Contents/MacOS/$EXEC_NAME" \
   "$SRC/App.swift"
 

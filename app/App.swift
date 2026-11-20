@@ -3,6 +3,8 @@
 //
 // 职责:
 //   * 每 30 分钟调用 vpn-node-guard.sh --json 做一次体检
+//   * 网络切换或重连稳定后自动补做一次体检
+//   * Clash 中 ChatGPT 的节点选择变化后自动补测
 //   * 节点不稳定时在菜单栏变色提醒 + 发系统通知
 //   * 点击菜单栏图标展开详情: 当前节点状态 / 原因 / 建议切换的节点
 //   * 绝不自动切换节点 (切换由用户在 Clash Verge 里手动完成)
@@ -10,6 +12,7 @@
 
 import AppKit
 import SwiftUI
+import SystemConfiguration
 import UserNotifications
 
 // MARK: - 数据模型
@@ -177,11 +180,178 @@ enum Engine {
     }
 }
 
+// MARK: - 网络变化监听
+
+final class NetworkChangeMonitor {
+    // 监听物理接口，忽略 utun 等 VPN 虚拟接口的内部变化。
+    private static let patterns = [
+        "State:/Network/Global/IPv[46]",
+        "State:/Network/Interface/(en[0-9]+|bridge[0-9]+)/(AirPort|Link|IPv[46])",
+    ]
+    private var store: SCDynamicStore?
+    private var source: CFRunLoopSource?
+    private var lastSnapshot = NSDictionary()
+    private let onChange: (Bool) -> Void
+
+    init(onChange: @escaping (Bool) -> Void) {
+        self.onChange = onChange
+        var context = SCDynamicStoreContext(
+            version: 0, info: Unmanaged.passUnretained(self).toOpaque(),
+            retain: nil, release: nil, copyDescription: nil)
+        guard let store = SCDynamicStoreCreate(nil, "VPNNodeHelper" as CFString, { _, _, info in
+            guard let info = info else { return }
+            Unmanaged<NetworkChangeMonitor>.fromOpaque(info).takeUnretainedValue().refresh()
+        }, &context),
+              SCDynamicStoreSetNotificationKeys(store, nil, Self.patterns as CFArray),
+              let source = SCDynamicStoreCreateRunLoopSource(nil, store, 0) else {
+            AppLog.write("网络变化监听启动失败")
+            return
+        }
+        self.store = store
+        self.source = source
+        lastSnapshot = snapshot()
+        CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
+        AppLog.write("网络变化监听已启动")
+    }
+
+    deinit {
+        if let source = source {
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .commonModes)
+        }
+    }
+
+    private func snapshot() -> NSDictionary {
+        guard let store = store,
+              let values = SCDynamicStoreCopyMultiple(store, nil, Self.patterns as CFArray)
+                as? [String: [String: Any]] else { return NSDictionary() }
+        return Self.connectionSnapshot(values)
+    }
+
+    var isConnected: Bool { Self.hasNetwork(snapshot()) }
+
+    static func hasNetwork(_ snapshot: NSDictionary) -> Bool {
+        guard let values = snapshot as? [String: [String: Any]] else { return false }
+        return values.contains { key, value in
+            guard key.hasPrefix("State:/Network/Interface/"),
+                  key.hasSuffix("/IPv4") || key.hasSuffix("/IPv6"),
+                  let addresses = value["Addresses"] as? [String] else { return false }
+            let linkKey = String(key.dropLast(5)) + "/Link"
+            guard values[linkKey]?["Active"] as? Bool == true else { return false }
+            return addresses.contains { address in
+                let ip = address.lowercased()
+                if key.hasSuffix("/IPv4") {
+                    return ip != "0.0.0.0" && !ip.hasPrefix("169.254.") && !ip.hasPrefix("127.")
+                }
+                return ip != "::" && ip != "::1" &&
+                    !["fe8", "fe9", "fea", "feb", "ff"].contains(where: ip.hasPrefix)
+            }
+        }
+    }
+
+    static func connectionSnapshot(_ values: [String: [String: Any]]) -> NSDictionary {
+        var result = values
+        for (key, value) in values where key.hasSuffix("/AirPort") {
+            // AirPort 也会报告扫描、信道等变化；只保留连接身份及重连时间。
+            result[key] = value.filter {
+                ["SSID", "SSID_STR", "BSSID", "ProfileID", "AutoJoinTimestamp", "Power Status"].contains($0.key)
+            }
+        }
+        return result as NSDictionary
+    }
+
+    private func refresh() {
+        let current = snapshot()
+        guard !current.isEqual(lastSnapshot) else { return }
+        lastSnapshot = current
+        onChange(Self.hasNetwork(current))
+    }
+}
+
+// MARK: - Clash 节点选择监听
+
+final class NodeSelectionMonitor {
+    private var timer: Timer?
+    private var polling = false
+    private var lastSelection: [String]?
+    private var refreshGeneration = 0
+    private let onChange: ([String]) -> Void
+
+    init(onChange: @escaping ([String]) -> Void) {
+        self.onChange = onChange
+        let timer = Timer(timeInterval: 2, repeats: true) { [weak self] _ in self?.poll() }
+        RunLoop.main.add(timer, forMode: .common)
+        self.timer = timer
+        poll()
+    }
+
+    deinit { timer?.invalidate() }
+
+    private func poll() {
+        guard !polling else { return }
+        polling = true
+        Task { @MainActor [weak self] in
+            guard let self = self else { return }
+            await self.refresh()
+            self.polling = false
+        }
+    }
+
+    @MainActor
+    func refresh() async {
+        refreshGeneration += 1
+        let generation = refreshGeneration
+        let selection = await Task.detached(priority: .utility) { Self.readSelection() }.value
+        guard generation == refreshGeneration, let selection = selection else { return }
+        let previous = lastSelection
+        lastSelection = selection
+        if let previous = previous, previous != selection { onChange(selection) }
+    }
+
+    static func selectionPath(_ proxies: [String: [String: Any]], group: String = "ChatGPT") -> [String]? {
+        var path: [String] = []
+        var name = group
+        while !path.contains(name), let proxy = proxies[name] {
+            path.append(name)
+            guard let next = proxy["now"] as? String, !next.isEmpty else {
+                return proxy["all"] == nil ? path : nil
+            }
+            name = next
+        }
+        return nil
+    }
+
+    private static func readSelection() -> [String]? {
+        let fm = FileManager.default
+        let paths = [
+            "/var/run/clash-verge-service/users/\(getuid())/verge-mihomo.sock",
+            NSHomeDirectory() + "/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev/verge-mihomo.sock",
+            "/tmp/verge-mihomo.sock",
+            fm.temporaryDirectory.appendingPathComponent("verge-mihomo.sock").path,
+        ]
+        guard let socket = paths.first(where: fm.fileExists(atPath:)) else { return nil }
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
+        process.arguments = ["--silent", "--fail", "--max-time", "2", "--unix-socket", socket,
+                             "http://localhost/proxies"]
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = FileHandle.nullDevice
+        do { try process.run() } catch { return nil }
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0,
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let proxies = json["proxies"] as? [String: [String: Any]] else { return nil }
+        return selectionPath(proxies)
+    }
+}
+
 // MARK: - 状态模型
 
 final class GuardModel: ObservableObject {
     @Published var report: Report?
     @Published var running = false
+    @Published var networkAvailable = true
     @Published var errorText: String?
     @Published var lastRunAt: Date?
     /// 本轮检测的开始时间, 用于显示"已用时" —— 不稳定时要并行探测所有候选,
@@ -192,14 +362,73 @@ final class GuardModel: ObservableObject {
     let intervalMinutes: Double = 30
 
     private var timer: Timer?
+    private var networkMonitor: NetworkChangeMonitor?
+    private var networkChangeTimer: Timer?
+    private var pendingNetworkCheck = false
+    private var networkRevision = 0
+    private var selectionMonitor: NodeSelectionMonitor?
+    private var selectionChangeTimer: Timer?
+    private var pendingSelectionCheck = false
+    private var selectionRevision = 0
+    private let check: () async -> CheckOutcome
     private var lastAlert = false
     private var lastState = ""
 
-    init(skipAutoStart: Bool = false) {
+    init(skipAutoStart: Bool = false, check: @escaping () async -> CheckOutcome = Engine.check) {
+        self.check = check
         guard !skipAutoStart else { return }
         AppLog.write("App 启动, 检测间隔 \(Int(intervalMinutes)) 分钟")
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
         scheduleTimer()
+        networkMonitor = NetworkChangeMonitor { [weak self] in self?.networkDidChange(isConnected: $0) }
+        networkAvailable = networkMonitor?.isConnected ?? true
+        selectionMonitor = NodeSelectionMonitor { [weak self] in self?.nodeSelectionDidChange($0) }
+        AppLog.write("Clash 节点选择监听已启动 (每 2 秒检查 ChatGPT 实际路径)")
+        runNow()
+    }
+
+    func nodeSelectionDidChange(_ path: [String]) {
+        selectionRevision += 1
+        pendingSelectionCheck = true
+        report = nil
+        lastRunAt = nil
+        errorText = nil
+        selectionChangeTimer?.invalidate()
+        AppLog.write("Clash 节点选择变化: \(path.joined(separator: " -> ")), 自动检测已排队")
+        let timer = Timer(timeInterval: 0.5, repeats: false) { [weak self] _ in
+            guard let self = self else { return }
+            self.selectionChangeTimer = nil
+            self.runPendingNetworkCheck()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        selectionChangeTimer = timer
+    }
+
+    func networkDidChange(isConnected: Bool = true) {
+        networkRevision += 1
+        networkAvailable = isConnected
+        networkChangeTimer?.invalidate()
+        networkChangeTimer = nil
+        pendingNetworkCheck = true
+        guard networkAvailable else {
+            AppLog.write("当前无网络, 暂停检测, 等待网络恢复")
+            return
+        }
+        AppLog.write("网络发生变化, 等待 5 秒稳定后检测")
+        let t = Timer(timeInterval: 5, repeats: false) { [weak self] _ in
+            guard let self = self else { return }
+            self.networkChangeTimer = nil
+            if self.running { AppLog.write("检测仍在运行, 网络变化检测已排队") }
+            self.runPendingNetworkCheck()
+        }
+        RunLoop.main.add(t, forMode: .common)
+        networkChangeTimer = t
+    }
+
+    private func runPendingNetworkCheck() {
+        guard pendingNetworkCheck || pendingSelectionCheck, networkAvailable,
+              networkChangeTimer == nil, selectionChangeTimer == nil, !running else { return }
+        AppLog.write(pendingSelectionCheck ? "节点选择稳定, 自动触发检测" : "网络变化稳定, 自动触发检测")
         runNow()
     }
 
@@ -214,15 +443,37 @@ final class GuardModel: ObservableObject {
     }
 
     func runNow() {
+        guard networkAvailable else {
+            pendingNetworkCheck = true
+            AppLog.write("当前无网络, 跳过检测, 等待网络恢复")
+            return
+        }
         if running { return }
+        // 手动或定时检测若已覆盖稳定后的网络变化，无需再补测。
+        if networkChangeTimer == nil { pendingNetworkCheck = false }
+        if selectionChangeTimer == nil { pendingSelectionCheck = false }
         running = true
         errorText = nil
         checkStartedAt = Date()
+        let revision = networkRevision
         Task { @MainActor in
-            let result = await Engine.check()
+            await self.selectionMonitor?.refresh()
+            self.selectionChangeTimer?.invalidate()
+            self.selectionChangeTimer = nil
+            self.pendingSelectionCheck = false
+            let selectionRevision = self.selectionRevision
+            let result = await self.check()
+            // 接收结果前再读一次选择，覆盖最后一次轮询后发生的切换。
+            await self.selectionMonitor?.refresh()
             let took = self.checkStartedAt.map { Date().timeIntervalSince($0) } ?? 0
             self.running = false
             self.checkStartedAt = nil
+            guard self.networkAvailable, revision == self.networkRevision,
+                  selectionRevision == self.selectionRevision else {
+                AppLog.write("检测期间网络或节点发生变化, 忽略本次结果, 等待稳定后补测")
+                self.runPendingNetworkCheck()
+                return
+            }
             self.lastRunAt = Date()
             switch result {
             case .success(let r):
@@ -237,6 +488,7 @@ final class GuardModel: ObservableObject {
                 self.errorText = msg
                 AppLog.write(String(format: "检测失败 用时%.1fs: %@", took, msg))
             }
+            self.runPendingNetworkCheck()
         }
     }
 
@@ -277,6 +529,7 @@ final class GuardModel: ObservableObject {
     // MARK: 展示用派生属性
 
     var stateText: String {
+        if !networkAvailable { return "无网络" }
         if running && report == nil { return "检测中" }
         guard let r = report else { return "检测中" }
         if !r.vpn { return "未开代理" }
@@ -292,6 +545,7 @@ final class GuardModel: ObservableObject {
 
     /// 菜单栏文字: 直接显示节点状态, 一眼看出问题
     var menuBarText: String {
+        if !networkAvailable { return "等待联网" }
         guard let r = report else { return "节点检测中" }
         if !r.vpn { return "节点未开" }
         switch r.state {
@@ -303,6 +557,7 @@ final class GuardModel: ObservableObject {
     }
 
     var iconName: String {
+        if !networkAvailable { return "wifi.slash" }
         guard let r = report else { return "hourglass" }
         if !r.vpn { return "wifi.slash" }
         switch r.state {
@@ -316,6 +571,7 @@ final class GuardModel: ObservableObject {
     }
 
     var tint: Color {
+        if !networkAvailable { return .secondary }
         guard let r = report else { return .secondary }
         if !r.vpn { return .secondary }
         switch r.state {
@@ -327,6 +583,7 @@ final class GuardModel: ObservableObject {
     }
 
     var hasProblem: Bool {
+        guard networkAvailable else { return false }
         guard let r = report else { return false }
         return r.vpn && (r.state == "unstable" || r.state == "down")
     }
@@ -366,7 +623,7 @@ struct PanelView: View {
                     .foregroundStyle(model.tint)
             }
             Spacer()
-            if model.running {
+            if model.running && model.networkAvailable {
                 ProgressView().controlSize(.small)
             }
         }
@@ -379,7 +636,7 @@ struct PanelView: View {
         // 检测进行中时, 用 TimelineView 每秒刷新"已用时" ——
         // 节点不稳定时要并行探测所有候选, 可能跑 1~2 分钟,
         // 没有进度反馈会让人以为卡死了。
-        if model.running, let startedAt = model.checkStartedAt {
+        if model.running && model.networkAvailable, let startedAt = model.checkStartedAt {
             TimelineView(.periodic(from: .now, by: 1)) { _ in
                 HStack(spacing: 6) {
                     ProgressView().controlSize(.small)
@@ -391,7 +648,10 @@ struct PanelView: View {
             }
         }
 
-        if let err = model.errorText {
+        if !model.networkAvailable {
+            Text("当前无网络，恢复联网后将自动检测。")
+                .font(.system(size: 12))
+        } else if let err = model.errorText {
             Label(err, systemImage: "exclamationmark.circle")
                 .font(.system(size: 11))
                 .foregroundStyle(.red)
@@ -561,7 +821,11 @@ struct PanelView: View {
 
     private var footer: some View {
         VStack(alignment: .leading, spacing: 8) {
-            if let t = model.lastRunAt {
+            if !model.networkAvailable {
+                Text("等待网络恢复…")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+            } else if let t = model.lastRunAt {
                 Text("上次检测：\(Self.fmt.string(from: t))")
                     .font(.system(size: 10))
                     .foregroundStyle(.secondary)
@@ -573,7 +837,7 @@ struct PanelView: View {
 
             HStack(spacing: 8) {
                 Button("立即检测") { model.runNow() }
-                    .disabled(model.running)
+                    .disabled(model.running || !model.networkAvailable)
                 Button("打开 Clash Verge") { openClashVerge() }
                 Spacer()
                 Button("退出") { NSApplication.shared.terminate(nil) }

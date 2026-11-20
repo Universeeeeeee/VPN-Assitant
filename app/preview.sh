@@ -10,7 +10,7 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUT="${1:-/tmp/panel_preview.png}"
 
 PREVIEW_OUT="$OUT" swiftc -D DEMO -swift-version 5 -target arm64-apple-macos13.0 \
-  -framework AppKit -framework SwiftUI -framework UserNotifications \
+  -framework AppKit -framework SwiftUI -framework UserNotifications -framework SystemConfiguration \
   -o "$DIR/.preview-bin" \
   "$DIR/App.swift" "$DIR/Preview.swift"
 
